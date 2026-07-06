@@ -1,0 +1,21 @@
+{
+  "collections": [{
+    "name": "Pipelith CI example",
+    "requests": [
+      {
+        "name": "Health check",
+        "method": "GET",
+        "url": "{{baseUrl}}/health",
+        "responseSchema": { "enabled": true, "schema": "{\"type\":\"object\",\"required\":[\"ready\"],\"properties\":{\"ready\":{\"type\":\"boolean\"}}}" },
+        "testScript": "test('healthy', () => expect(response.status).toBe(200)); test('ready', () => expect(response.json.ready).toBe(true)); Pipelith.chain.message = 'hello from CI';"
+      },
+      {
+        "name": "Echo chained data",
+        "method": "POST",
+        "url": "{{baseUrl}}/echo",
+        "body": { "type": "json", "raw": "{\"message\":\"{{chain.message}}\"}" },
+        "testScript": "test('echo', () => expect(response.json.message).toBe('hello from CI'));"
+      }
+    ]
+  }]
+}

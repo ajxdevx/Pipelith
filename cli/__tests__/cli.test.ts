@@ -1,0 +1,360 @@
+// @vitest-environment node
+import { beforeAll, afterAll, beforeEach, afterEach, describe, expect, it } from 'vitest';
+import { createServer } from 'node:http';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+
+const exec = promisify(execFile);
+const root = resolve(import.meta.dirname, '../..');
+const entry = join(root, 'bin/pipelith.cjs');
+const hits: string[] = [];
+const server = createServer(async (request, response) => {
+  hits.push(request.url!);
+  if (request.url === '/hang') { response.writeHead(200); response.write('partial'); return; }
+  if (request.url === '/stream') { response.writeHead(200); response.write('start'); setTimeout(() => response.end('end'), 75); return; }
+  if (request.url === '/schema-slow') {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify('a'.repeat(35) + '!'));
+    return;
+  }
+  const parts: Buffer[] = [];
+  for await (const part of request) parts.push(part);
+  const body = Buffer.concat(parts);
+  response.writeHead(request.url === '/failure' ? 500 : 200, {
+    'content-type': 'application/json', 'set-cookie': ['session=one; Path=/', 'second=two; Path=/'],
+  });
+  let json = null;
+  try { json = JSON.parse(body.toString()); } catch { /* Non-JSON request. */ }
+  response.end(JSON.stringify({ token: 'response-secret', headers: request.headers, method: request.method, body: body.toString(), base64: body.toString('base64'), json, url: request.url }));
+});
+
+let base = '';
+let directory = '';
+beforeAll(async () => {
+  await exec(process.execPath, ['scripts/build-cli.mjs'], { cwd: root });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  base = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
+}, 30_000);
+afterAll(async () => {
+  server.closeAllConnections();
+  await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+});
+beforeEach(async () => { directory = await mkdtemp(join(tmpdir(), 'pipelith-cli-')); hits.length = 0; });
+afterEach(async () => {
+  if (!resolve(directory).startsWith(resolve(tmpdir(), 'pipelith-cli-'))) throw new Error('Unexpected temporary test path');
+  await rm(directory, { recursive: true, force: true });
+});
+
+async function jsonFile(name: string, data: unknown) {
+  const file = join(directory, name);
+  await writeFile(file, JSON.stringify(data));
+  return file;
+}
+
+async function cli(args: string[], environment: Record<string, string> = {}) {
+  try {
+    const result = await exec(process.execPath, [entry, ...args], {
+      cwd: directory, env: { ...process.env, ...environment }, timeout: 15_000,
+    });
+    return { code: 0, ...result };
+  } catch (error) {
+    const result = error as Error & { code: number; stdout: string; stderr: string; killed?: boolean };
+    if (result.killed || typeof result.code !== 'number') throw error;
+    return { code: result.code, stdout: result.stdout, stderr: result.stderr };
+  }
+}
+
+function request(overrides: Record<string, unknown> = {}) {
+  return { name: 'Request', method: 'GET', url: `${base}/ok`, ...overrides };
+}
+
+describe('packaged CLI against real HTTP endpoints', () => {
+  it('benchmarks warm-ups and measured iterations with schema assertions and per-request thresholds', async () => {
+    const file = await jsonFile('benchmark.json', { name: 'Performance', requests: [
+      request({ name: 'Fast', responseSchema: { enabled: true, schema: '{"type":"object"}' },
+        testScript: 'test("fresh chain", () => expect(Pipelith.chain.token).toBe(undefined)); Pipelith.chain.token = "secret-token";' }),
+      request({ name: 'Stream', url: `${base}/stream`, testScript: 'test("chain", () => expect(Pipelith.chain.token).toBe("secret-token"));' }),
+    ] });
+    const result = await cli(['bench', file, '--iterations', '2', '--warmup', '1', '--threshold', 'p95<60000', '--threshold', 'failureRate<=0', '--report-json', 'benchmark.json.out', '--report-junit', 'benchmark.xml']);
+    expect(result, result.stderr + result.stdout).toMatchObject({ code: 0 });
+    const raw = await readFile(join(directory, 'benchmark.json.out'), 'utf8');
+    const report = JSON.parse(raw);
+    expect(report.kind).toBe('benchmark');
+    expect(report.summary).toMatchObject({ total: 4, completed: 4, passed: 4, warmup: { completed: 2 } });
+    expect(report.requests[1].latency).toMatchObject({ samples: 2 });
+    expect(report.requests[1].latency.min).toBeGreaterThanOrEqual(60);
+    expect(report.samples[0].tests[0]).toEqual({ name: 'Response schema', passed: true });
+    expect(report.samples[0].durationMs).toBeGreaterThan(report.samples[0].httpTimeMs);
+    expect(hits).toEqual(['/ok', '/stream', '/ok', '/stream', '/ok', '/stream']);
+    expect(raw).not.toContain('secret-token');
+    expect(raw).not.toContain(base);
+    expect(await readFile(join(directory, 'benchmark.xml'), 'utf8')).toContain('tests="10" failures="0" errors="0" skipped="0"');
+  });
+
+  it('returns failure for performance limits and selects a single request', async () => {
+    const file = await jsonFile('benchmark.json', { requests: [request({ name: 'One' }), request({ name: 'Two' })] });
+    const result = await cli(['bench', file, '--request', 'Two', '--iterations', '1', '--threshold', 'p95<0', '--report-junit', 'failed.xml']);
+    expect(result.code).toBe(1);
+    expect(hits).toHaveLength(1);
+    expect(result.stdout).toContain('FAIL Two:');
+    expect(await readFile(join(directory, 'failed.xml'), 'utf8')).toContain('tests="2" failures="1"');
+  });
+
+  it('bails on a schema failure during warm-up and reports skipped measurements', async () => {
+    const file = await jsonFile('benchmark.json', { requests: [request({ responseSchema: { enabled: true, schema: 'false' } })] });
+    const result = await cli(['bench', file, '--warmup', '1', '--iterations', '2', '--bail', '--report-json', 'result.json']);
+    expect(result.code).toBe(1);
+    const report = JSON.parse(await readFile(join(directory, 'result.json'), 'utf8'));
+    expect(report.summary).toMatchObject({ completed: 0, skipped: 2, warmup: { failed: 1 } });
+    expect(hits).toHaveLength(1);
+  });
+
+  it('times out benchmark requests without turning network errors into zero latency samples', async () => {
+    const file = await jsonFile('benchmark.json', { requests: [request({ url: `${base}/hang` })] });
+    const result = await cli(['bench', file, '--iterations', '1', '--timeout-request', '100', '--threshold', 'p95<1000', '--report-json', 'result.json']);
+    expect(result.code).toBe(1);
+    const report = JSON.parse(await readFile(join(directory, 'result.json'), 'utf8'));
+    expect(report.summary).toMatchObject({ errored: 1, latency: { samples: 0, p95: null } });
+    expect(report.checks[0].passed).toBe(false);
+  });
+
+  it('rejects invalid benchmark options and workloads before making requests', async () => {
+    const file = await jsonFile('benchmark.json', { requests: [request(), request()] });
+    for (const args of [['--iterations', '0'], ['--iterations', '5001'], ['--warmup', '-1'], ['--threshold', 'wrong<5'], ['--threshold', 'failureRate<101'], ['--request', 'Request']]) {
+      expect((await cli(['bench', file, ...args])).code).toBe(2);
+    }
+    expect((await cli(['run', file, '--iterations', '2'])).code).toBe(2);
+    expect(hits).toHaveLength(0);
+  });
+
+  it('combines schema and script assertions in JSON and JUnit reports', async () => {
+    const schema = (type: string) => ({ enabled: true, schema: JSON.stringify({ type: 'object', required: ['method'], properties: { method: { type } } }) });
+    const file = await jsonFile('schemas.json', { requests: [
+      request({ name: 'Valid schema', responseSchema: schema('string') }),
+      request({ name: 'Mismatch', responseSchema: schema('integer'), testScript: 'test("status", () => expect(response.status).toBe(200));' }),
+      request({ name: 'Invalid schema', responseSchema: { enabled: true, schema: '{' } }),
+      request({ name: 'Disabled schema', responseSchema: { enabled: false, schema: '{' } }),
+    ] });
+    const result = await cli(['run', file, '--report-json', 'result.json', '--report-junit', 'result.xml']);
+    expect(result.code).toBe(1);
+    const report = JSON.parse(await readFile(join(directory, 'result.json'), 'utf8'));
+    expect(report.summary).toMatchObject({ total: 4, passed: 2, failed: 1, errored: 1 });
+    expect(report.requests[0].tests).toEqual([{ name: 'Response schema', passed: true }]);
+    expect(report.requests[1].tests).toEqual([
+      { name: 'Response schema: /method', passed: false, error: 'must be integer' },
+      { name: 'status', passed: true },
+    ]);
+    expect(report.requests[2].error).toContain('not valid JSON');
+    expect(report.requests[3].tests).toEqual([]);
+    const xml = await readFile(join(directory, 'result.xml'), 'utf8');
+    expect(xml).toContain('tests="4" failures="1" errors="1" skipped="0"');
+    expect(xml).toContain('Response schema: /method');
+    expect(hits).toHaveLength(4);
+  });
+
+  it('returns success for a matching schema and bails on a mismatch', async () => {
+    const file = await jsonFile('schemas.json', { requests: [request({ responseSchema: { enabled: true, schema: 'true' } })] });
+    expect((await cli(['run', file])).code).toBe(0);
+    hits.length = 0;
+    await jsonFile('schemas.json', { requests: [request({ responseSchema: { enabled: true, schema: 'false' } }), request()] });
+    expect((await cli(['run', file, '--bail', '--report-json', 'result.json'])).code).toBe(1);
+    expect(JSON.parse(await readFile(join(directory, 'result.json'), 'utf8')).summary).toMatchObject({ failed: 1, skipped: 1 });
+    expect(hits).toHaveLength(1);
+  });
+
+  it('terminates a slow schema worker and continues the collection', async () => {
+    const file = await jsonFile('schemas.json', { requests: [
+      request({ url: `${base}/schema-slow`, responseSchema: { enabled: true, schema: JSON.stringify({ type: 'string', pattern: '^(a+)+$' }) } }),
+      request(),
+    ] });
+    const result = await cli(['run', file, '--report-json', 'result.json']);
+    expect(result.code).toBe(1);
+    expect(result.stdout).toContain('Response schema validation exceeded 2000ms');
+    expect(JSON.parse(await readFile(join(directory, 'result.json'), 'utf8')).summary).toMatchObject({ passed: 1, errored: 1 });
+    expect(hits).toEqual(['/schema-slow', '/ok']);
+  }, 15_000);
+
+  it('rejects malformed schema configuration before making requests', async () => {
+    for (const responseSchema of ['{}', null, { enabled: 'yes', schema: '{}' }, { enabled: true, schema: {} }]) {
+      const file = await jsonFile('invalid.json', { requests: [request({ responseSchema })] });
+      const result = await cli(['run', file]);
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain('responseSchema');
+    }
+    expect(hits).toHaveLength(0);
+  });
+
+  it('runs UI exports with environment overrides, scripts, GraphQL and chaining, and writes reports', async () => {
+    const file = await jsonFile('collection.json', { collections: [{ name: 'CI suite', requests: [
+      request({
+        name: 'Login', url: '{{base}}/token',
+        preRequestScript: 'Pipelith.request.headers["X-Marker"] = Pipelith.variables.marker;',
+        testScript: 'test("header override", () => expect(response.json.headers["x-marker"]).toBe("from-env")); Pipelith.chain.token = response.json.token;',
+      }),
+      request({
+        name: 'GraphQL', method: 'POST', url: '{{base}}/graphql',
+        auth: { type: 'bearer', bearer: { token: '{{chain.token}}' } },
+        body: { type: 'graphql', graphql: { query: 'query Q($limit: Int!) { items(limit: $limit) { id } }', variables: '{"limit":{{limit}}}', operationName: 'Q' } },
+        testScript: `test("auth chain", () => expect(response.json.headers.authorization).toBe("Bearer response-secret"));
+          test("GraphQL payload", () => expect(response.json.json.variables.limit).toBe(2));
+          test("cookies", () => expect(response.cookies.length).toBe(2));`,
+      }),
+    ] }] });
+    const env = await jsonFile('env.json', { variables: [{ key: 'base', value: base, enabled: true }, { key: 'marker', value: 'original' }] });
+    const result = await cli(['run', file, '--env', env, '--var', 'limit=2', '--var', 'marker=literal', '--var-from-env', 'marker=PIPELITH_TEST_MARKER', '--report-json', 'reports/result.json', '--report-junit', 'reports/result.xml'], { PIPELITH_TEST_MARKER: 'from-env' });
+    expect(result, result.stderr + result.stdout).toMatchObject({ code: 0 });
+    expect(hits).toEqual(['/token', '/graphql']);
+    const reportText = await readFile(join(directory, 'reports/result.json'), 'utf8');
+    const report = JSON.parse(reportText);
+    expect(report.summary).toMatchObject({ total: 2, passed: 2, failed: 0, errored: 0, skipped: 0 });
+    expect(report.requests[1].tests).toHaveLength(3);
+    expect(reportText).not.toContain('response-secret');
+    expect(reportText).not.toContain('authorization');
+    expect(await readFile(join(directory, 'reports/result.xml'), 'utf8')).toContain('tests="2" failures="0" errors="0" skipped="0"');
+  });
+
+  it('returns 1 for assertions and stops before later requests when --bail is set', async () => {
+    const file = await jsonFile('collection.json', { name: 'Failure suite', requests: [
+      request({ testScript: 'test("wrong status", () => expect(response.status).toBe(201));' }),
+      request({ url: `${base}/must-not-run` }),
+    ] });
+    const result = await cli(['run', file, '--bail', '--report-json', 'result.json', '--report-junit', 'result.xml']);
+    expect(result.code).toBe(1);
+    expect(hits).toEqual(['/ok']);
+    expect(JSON.parse(await readFile(join(directory, 'result.json'), 'utf8')).summary).toMatchObject({ failed: 1, skipped: 1 });
+    expect(await readFile(join(directory, 'result.xml'), 'utf8')).toContain('failures="1" errors="0" skipped="1"');
+  });
+
+  it('counts unhandled script errors even after passing assertions, and keeps running', async () => {
+    const file = await jsonFile('collection.json', { requests: [
+      request({ testScript: 'throw new Error("before assertions");' }),
+      request({ testScript: 'test("passes", () => {}); throw new Error("after assertions");' }),
+      request({ preRequestScript: 'throw new Error("pre failed");' }),
+      request(),
+    ] });
+    const result = await cli(['run', file, '--report-json', 'result.json']);
+    expect(result.code).toBe(1);
+    expect(JSON.parse(await readFile(join(directory, 'result.json'), 'utf8')).summary).toMatchObject({ passed: 1, errored: 3 });
+    expect(hits).toHaveLength(3);
+  });
+
+  it('times out streaming response bodies and reports HTTP failures without assertions', async () => {
+    const file = await jsonFile('collection.json', { requests: [request({ url: `${base}/hang` }), request({ url: `${base}/failure` })] });
+    const result = await cli(['run', file, '--timeout-request', '150', '--report-json', 'result.json']);
+    expect(result.code).toBe(1);
+    expect(result.stdout).toContain('Request timed out after 150ms');
+    expect(JSON.parse(await readFile(join(directory, 'result.json'), 'utf8')).summary).toMatchObject({ failed: 1, errored: 1 });
+  });
+
+  it('terminates infinite scripts and allows subsequent requests to finish', async () => {
+    const file = await jsonFile('collection.json', { requests: [request({ preRequestScript: 'while (true) {}' }), request()] });
+    const result = await cli(['run', file, '--timeout-script', '100']);
+    expect(result.code).toBe(1);
+    expect(result.stdout).toContain('Script timed out after 100ms');
+    expect(result.stdout).toContain('1 passed, 0 failed, 1 errored');
+    expect(hits).toEqual(['/ok']);
+  });
+
+  it('provides script assertions without Node globals or inherited process secrets', async () => {
+    const file = await jsonFile('collection.json', { requests: [request({ testScript: `
+      test("no process", () => expect(typeof process).toBe("undefined"));
+      test("no require", () => expect(typeof require).toBe("undefined"));
+      test("no Buffer", () => expect(typeof Buffer).toBe("undefined"));
+      test("no host globals", () => expect(typeof global).toBe("undefined"));
+      test("assertions work", () => expect(response.status).toBe(200));
+    ` })] });
+    expect((await cli(['run', file], { PIPELITH_PRIVATE_VALUE: 'secret' })).code).toBe(0);
+  });
+
+  // Windows child.kill() force-terminates instead of delivering POSIX SIGINT.
+  it.skipIf(process.platform === 'win32')('writes partial benchmark reports when interrupted', async () => {
+    const file = await jsonFile('benchmark.json', { requests: [request({ url: `${base}/hang` })] });
+    const child = spawn(process.execPath, [entry, 'bench', file, '--iterations', '3', '--report-json', 'partial.json', '--report-junit', 'partial.xml'], { cwd: directory, stdio: 'pipe', windowsHide: true });
+    const interrupt = () => { child.kill('SIGINT'); };
+    server.once('request', interrupt);
+    try {
+      const code = await new Promise<number | null>((resolve, reject) => { child.once('exit', resolve); child.once('error', reject); });
+      expect(code).toBe(130);
+      const report = JSON.parse(await readFile(join(directory, 'partial.json'), 'utf8'));
+      expect(report.outcome).toBe('aborted');
+      expect(report.summary).toMatchObject({ completed: 1, errored: 1, skipped: 2 });
+      expect(await readFile(join(directory, 'partial.xml'), 'utf8')).toContain('Benchmark interrupted');
+    } finally {
+      server.removeListener('request', interrupt);
+      if (child.exitCode === null) child.kill();
+    }
+  });
+
+  it.skipIf(process.platform === 'win32')('writes partial reports and exits 130 when interrupted', async () => {
+    const file = await jsonFile('collection.json', { requests: [request({ url: `${base}/hang` }), request()] });
+    const child = spawn(process.execPath, [entry, 'run', file, '--report-json', 'partial.json'], { cwd: directory, stdio: 'pipe', windowsHide: true });
+    const interrupt = () => { child.kill('SIGINT'); };
+    server.once('request', interrupt);
+    try {
+      const code = await new Promise<number | null>((resolve, reject) => {
+        child.once('exit', resolve);
+        child.once('error', reject);
+      });
+      expect(code).toBe(130);
+      const report = JSON.parse(await readFile(join(directory, 'partial.json'), 'utf8'));
+      expect(report.summary).toMatchObject({ errored: 1, skipped: 1 });
+      expect(report.requests[1].skipReason).toBe('aborted');
+    } finally {
+      server.removeListener('request', interrupt);
+      if (child.exitCode === null) child.kill();
+    }
+  });
+
+  it('reads binary and multipart attachments relative to the collection file', async () => {
+    await writeFile(join(directory, 'payload.txt'), 'file-content');
+    const file = await jsonFile('collection.json', { requests: [
+      request({ method: 'POST', body: { type: 'binary', binaryFile: { filePath: 'payload.txt' } }, testScript: 'test("binary", () => expect(response.json.body).toBe("file-content"));' }),
+      request({ method: 'POST', body: { type: 'form-data', formData: [{ key: 'upload', valueType: 'file', filePath: 'payload.txt' }, { key: 'label', value: 'hello' }] }, testScript: 'test("file", () => expect(response.json.body).toContain("file-content")); test("text", () => expect(response.json.body).toContain("hello"));' }),
+    ] });
+    const result = await cli(['run', file]);
+    expect(result, result.stderr + result.stdout).toMatchObject({ code: 0 });
+    expect(hits).toHaveLength(2);
+  });
+
+  it('fails clearly for exported file metadata with no attachment path', async () => {
+    const file = await jsonFile('collection.json', { requests: [request({ method: 'POST', body: { type: 'binary', binaryFile: { fileName: 'old.txt' } } })] });
+    const result = await cli(['run', file]);
+    expect(result.code).toBe(1);
+    expect(result.stdout).toContain('require filePath');
+    expect(hits).toHaveLength(0);
+  });
+
+  it('selects collections explicitly and refuses ambiguous exports', async () => {
+    const file = await jsonFile('collection.json', { collections: [{ name: 'One', requests: [request()] }, { name: 'Two', requests: [request()] }] });
+    expect((await cli(['run', file])).code).toBe(2);
+    expect(hits).toHaveLength(0);
+    expect((await cli(['run', file, '--collection', 'Two'])).code).toBe(0);
+    expect(hits).toHaveLength(1);
+  });
+
+  it('rejects invalid inputs and options before making requests', async () => {
+    const file = await jsonFile('collection.json', { requests: [request()] });
+    for (const args of [['--unknown'], ['--timeout-request', '0'], ['--delay', '-1'], ['--var', 'invalid'], ['--report-json', file]]) {
+      expect((await cli(['run', file, ...args])).code).toBe(2);
+    }
+    const invalid = await jsonFile('invalid.json', { requests: [request({ method: 'BAD' })] });
+    expect((await cli(['run', invalid])).code).toBe(2);
+    const empty = await jsonFile('empty.json', { requests: [] });
+    expect((await cli(['run', empty])).code).toBe(2);
+    const websocket = await jsonFile('ws.json', { requests: [request({ protocol: 'websocket' })] });
+    expect((await cli(['run', websocket])).code).toBe(2);
+    expect(hits).toHaveLength(0);
+  });
+
+  it('returns 2 when reports cannot be written, and provides help and version', async () => {
+    const file = await jsonFile('collection.json', { requests: [request()] });
+    await writeFile(join(directory, 'not-a-directory'), 'occupied');
+    expect((await cli(['run', file, '--report-json', 'not-a-directory/result.json'])).code).toBe(2);
+    expect((await cli(['--help'])).stdout).toContain('Usage: Pipelith run');
+    expect((await cli(['--version'])).stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+});

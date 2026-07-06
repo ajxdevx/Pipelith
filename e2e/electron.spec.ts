@@ -1,0 +1,98 @@
+import { test, expect, _electron as electron, type ElectronApplication } from '@playwright/test';
+import { createServer, type Server } from 'node:http';
+import path from 'node:path';
+
+test.describe('Electron desktop runtime', () => {
+  let app: ElectronApplication;
+  let api: Server;
+  let apiUrl: string;
+  let hangStarted = false;
+  let hangClosed = false;
+
+  test.beforeAll(async () => {
+    api = createServer((request, response) => {
+      response.writeHead(200, {
+        'content-type': 'application/json',
+        'x-pipelith-method': request.method ?? '',
+      });
+      if (request.url === '/hang') {
+        hangStarted = true;
+        response.on('close', () => { hangClosed = true; });
+        response.write('partial');
+        return;
+      }
+      response.end(JSON.stringify({ source: 'electron-ipc', method: request.method }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      api.once('error', reject);
+      api.listen(0, '127.0.0.1', resolve);
+    });
+    const address = api.address();
+    if (!address || typeof address === 'string') throw new Error('Test API did not bind to a TCP port');
+    apiUrl = `http://127.0.0.1:${address.port}/verify`;
+
+    const electronEnv = { ...process.env, NODE_ENV: 'test' };
+    delete electronEnv.ELECTRON_RUN_AS_NODE;
+    app = await electron.launch({
+      args: [path.resolve('electron/main.cjs')],
+      cwd: process.cwd(),
+      env: electronEnv,
+    });
+  });
+
+  test.afterAll(async () => {
+    await app?.close();
+    api?.closeAllConnections();
+    await new Promise<void>(resolve => api?.close(() => resolve()));
+  });
+
+  test('loads the packaged renderer, sends HTTP over IPC, and validates schemas in a worker', async () => {
+    const page = await app.firstWindow();
+    await expect(page).toHaveTitle('Pipelith - API Testing Tool');
+    await expect(page.getByText(/Pipelith v\d+\.\d+\.\d+/)).toBeVisible();
+
+    await page.getByPlaceholder('Enter URL or paste cURL command...').fill(apiUrl);
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+
+    await expect(page.getByText('200 OK')).toBeVisible();
+    await expect(page.getByText(/electron-ipc/)).toBeVisible();
+    await page.getByRole('button', { name: /Headers/ }).last().click();
+    await expect(page.getByText(/x-pipelith-method/i)).toBeVisible();
+
+    await page.getByRole('button', { name: 'Schema', exact: true }).click();
+    const editor = page.getByRole('textbox', { name: 'Response schema JSON' });
+    await editor.fill(JSON.stringify({ type: 'object', required: ['source'], properties: { source: { const: 'electron-ipc' } } }));
+    await page.getByRole('checkbox', { name: 'Validate response against schema' }).check();
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await page.getByRole('button', { name: /Tests/ }).click();
+    await expect(page.getByText('1 passed', { exact: true })).toBeVisible();
+
+    await editor.fill(JSON.stringify({ type: 'object', properties: { source: { type: 'integer' } } }));
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await expect(page.getByText('Response schema: /source', { exact: true })).toBeVisible();
+    await expect(page.getByText('must be integer', { exact: true })).toBeVisible();
+  });
+
+  test('benchmarks real HTTP latency and cancels an active desktop request', async () => {
+    const page = await app.firstWindow();
+    await page.reload();
+    await page.getByPlaceholder('Enter URL or paste cURL command...').fill(apiUrl);
+    await page.getByRole('button', { name: 'Benchmark request' }).click();
+    const dialog = page.getByRole('dialog', { name: /Benchmark/ });
+    await dialog.getByLabel('Iterations', { exact: true }).fill('2');
+    await dialog.getByLabel('Warm-up iterations').fill('1');
+    await dialog.getByLabel('Thresholds (optional)').fill('p95<60000, failureRate<=0');
+    await dialog.getByRole('button', { name: 'Start benchmark' }).click();
+    await expect(dialog.getByRole('status')).toContainText('Benchmark passed');
+    await expect(dialog.getByRole('status')).toContainText('2/2 measured requests');
+    await dialog.getByRole('button', { name: 'Close benchmark' }).click();
+
+    await page.getByPlaceholder('Enter URL or paste cURL command...').fill(apiUrl.replace('/verify', '/hang'));
+    await page.getByRole('button', { name: 'Benchmark request' }).click();
+    await dialog.getByRole('button', { name: 'Start benchmark' }).click();
+    await expect.poll(() => hangStarted).toBe(true);
+    await dialog.getByRole('button', { name: 'Stop benchmark' }).click();
+    await expect(dialog.getByRole('status')).toContainText('Benchmark aborted');
+    await expect.poll(() => hangClosed).toBe(true);
+  });
+});

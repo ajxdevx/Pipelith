@@ -1,0 +1,226 @@
+export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS';
+
+export type RequestProtocol = 'http' | 'websocket';
+
+export type WebSocketConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
+
+export type WebSocketMessageDirection = 'sent' | 'received';
+
+export interface WebSocketMessage {
+  id: string;
+  direction: WebSocketMessageDirection;
+  data: string;
+  timestamp: number;
+  size: number;
+  isBinary?: boolean;
+}
+
+export interface WebSocketSession {
+  status: WebSocketConnectionStatus;
+  messages: WebSocketMessage[];
+  connectedAt: number | null;
+  disconnectedAt: number | null;
+  error: string | null;
+}
+
+export interface KeyValuePair {
+  id: string;
+  key: string;
+  value: string;
+  enabled: boolean;
+  description?: string;
+}
+
+export interface FormDataEntry extends KeyValuePair {
+  valueType: 'text' | 'file';
+  fileName?: string;
+  fileSize?: number;
+  fileType?: string;
+  /** CLI attachment path, relative to the collection JSON. */
+  filePath?: string;
+}
+
+export type BodyType = 'none' | 'json' | 'text' | 'xml' | 'form-data' | 'x-www-form-urlencoded' | 'binary' | 'graphql';
+
+export type AuthType = 'none' | 'basic' | 'bearer' | 'api-key' | 'oauth2';
+
+export type OAuth2GrantType = 'authorization_code' | 'client_credentials';
+
+export interface OAuth2Token {
+  accessToken: string;
+  tokenType?: string;
+  expiresIn?: number;
+  refreshToken?: string;
+  scope?: string;
+  obtainedAt?: number;
+}
+
+export type OAuth2ClientAuth = 'post' | 'basic';
+
+export interface OAuth2Config {
+  grantType: OAuth2GrantType;
+  authUrl: string;
+  tokenUrl: string;
+  clientId: string;
+  clientSecret: string;
+  scope: string;
+  callbackUrl: string;
+  clientAuthMethod?: OAuth2ClientAuth;
+  state?: string;
+  token?: OAuth2Token;
+}
+
+export interface AuthConfig {
+  type: AuthType;
+  basic?: { username: string; password: string };
+  bearer?: { token: string };
+  apiKey?: { key: string; value: string; addTo: 'header' | 'query' };
+  oauth2?: OAuth2Config;
+}
+
+export interface RequestConfig {
+  id: string;
+  name: string;
+  method: HttpMethod;
+  url: string;
+  protocol?: RequestProtocol;
+  params: KeyValuePair[];
+  headers: KeyValuePair[];
+  body: {
+    type: BodyType;
+    raw: string;
+    formData: FormDataEntry[];
+    urlencoded: KeyValuePair[];
+    binaryFile?: {
+      fileName: string;
+      fileSize: number;
+      fileType: string;
+      filePath?: string;
+    };
+    graphql?: {
+      query: string;
+      variables: string;
+      operationName?: string;
+      extensions?: string;
+    };
+  };
+  auth: AuthConfig;
+  sslVerification?: boolean;
+  preRequestScript?: string;
+  testScript?: string;
+  responseSchema?: ResponseSchemaConfig;
+}
+
+export interface ResponseSchemaConfig {
+  enabled: boolean;
+  /** JSON Schema draft-07 source, retained as text so unfinished edits can be saved. */
+  schema: string;
+}
+
+export interface TestResult {
+  name: string;
+  passed: boolean;
+  error?: string;
+}
+
+export interface ScriptConsoleEntry {
+  type: 'log' | 'warn' | 'error' | 'info';
+  args: unknown[];
+  timestamp: number;
+}
+
+export interface ResponseData {
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  body: string;
+  size: number;
+  time: number;
+  /** Target HTTP round trip through body download, excluding scripts/validation. */
+  httpTimeMs?: number;
+  cookies: { name: string; value: string; domain?: string; path?: string }[];
+}
+
+export interface Collection {
+  id: string;
+  name: string;
+  description?: string;
+  requests: RequestConfig[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface HistoryEntry {
+  id: string;
+  request: RequestConfig;
+  response: ResponseData | null;
+  timestamp: number;
+}
+
+export interface Environment {
+  id: string;
+  name: string;
+  variables: KeyValuePair[];
+  isActive: boolean;
+}
+
+export interface Tab {
+  id: string;
+  requestId: string;
+  name: string;
+  method: HttpMethod;
+  protocol?: RequestProtocol;
+  isModified: boolean;
+  collectionId?: string;
+  sourceRequestId?: string;
+}
+
+export function createDefaultRequest(overrides?: Partial<RequestConfig>): RequestConfig {
+  return {
+    id: crypto.randomUUID(),
+    name: 'New Request',
+    method: 'GET',
+    url: '',
+    params: [],
+    headers: [],
+    body: {
+      type: 'none',
+      raw: '',
+      formData: [],
+      urlencoded: [],
+    },
+    auth: { type: 'none' },
+    ...overrides,
+  };
+}
+
+export function createDefaultWebSocketSession(): WebSocketSession {
+  return {
+    status: 'disconnected',
+    messages: [],
+    connectedAt: null,
+    disconnectedAt: null,
+    error: null,
+  };
+}
+
+export function createKeyValuePair(overrides?: Partial<KeyValuePair>): KeyValuePair {
+  return {
+    id: crypto.randomUUID(),
+    key: '',
+    value: '',
+    enabled: true,
+    ...overrides,
+  };
+}
+
+export function createFormDataEntry(overrides?: Partial<FormDataEntry>): FormDataEntry {
+  return {
+    id: crypto.randomUUID(),
+    key: '',
+    value: '',
+    enabled: true,
+    valueType: 'text',
+    ...overrides,
+  };
+}

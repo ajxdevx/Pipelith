@@ -1,0 +1,170 @@
+# Pipelith CLI
+
+Run the same HTTP and GraphQL collections used in Pipelith's browser and desktop apps from a terminal or CI pipeline. Requires Node.js 22.12 or newer. Requests go directly to the target API; a running Pipelith UI or proxy is not required.
+
+## Build and run
+
+From the repository:
+
+```sh
+npm ci
+npm run build:cli
+node bin/pipelith.cjs --help
+node bin/pipelith.cjs run collection.json --env environment.json --report-json reports/result.json --report-junit reports/result.xml
+```
+
+For a global `Pipelith` command, install the generated standalone package:
+
+```sh
+npm install --global ./dist-cli
+pipelith run collection.json --bail
+```
+
+The `dist-cli` package contains the CLI, its script and schema workers, documentation, and license. Its runtime dependencies are Undici, Ajv, and ajv-formats. It can also be packed with `npm pack ./dist-cli` for installation on another machine. Rebuild before packing after changing source files.
+
+## Collections and environments
+
+In Pipelith, choose **Collections → ... → Export collection**. The CLI accepts that `{ "collections": [...] }` export and a single `{ "name": "...", "requests": [...] }` collection object. If an export contains several collections, pass `--collection NAME_OR_ID`. Empty collections and unsupported WebSocket requests are rejected before execution.
+
+Requests support the same `{{variable}}` placeholders, Basic/Bearer/API-key authentication, SSL verification setting, pre-request scripts, assertions, and `{{chain.name}}` response chaining as the UI. GraphQL uses HTTP POST with the existing query/variables body format. OAuth requests can use a saved access token; the CLI does not launch interactive OAuth flows or refresh tokens. For CI, provide a current token through a Bearer auth variable.
+
+An environment file can be a simple string-valued map:
+
+```json
+{
+  "baseUrl": "http://127.0.0.1:4010",
+  "token": ""
+}
+```
+
+It can also be a Pipelith environment object with a `variables` array of `{ "key", "value", "enabled" }` entries. Disabled entries are ignored. Overrides are applied after the file, in command-line order:
+
+```sh
+pipelith run collection.json --env environment.json --var baseUrl=https://staging.example.com --var-from-env token=API_TOKEN
+```
+
+`--var` and `--var-from-env` are repeatable. The latter reads an explicitly named process environment variable, so CI secrets do not need to be stored in collection files or passed as literal command-line arguments. An unset process variable is an input error. Chain variables start empty for each run and are shared only between requests in that run.
+
+### File uploads
+
+UI exports contain file metadata, not file contents. To run a binary upload, add `filePath` to `body.binaryFile`. For multipart uploads, add `filePath` to each enabled file entry in `body.formData`. Paths resolve relative to the collection JSON and support environment and chain placeholders. Missing files fail the request explicitly.
+
+```json
+{
+  "type": "binary",
+  "binaryFile": {
+    "filePath": "fixtures/payload.bin",
+    "fileName": "payload.bin",
+    "fileType": "application/octet-stream"
+  }
+}
+```
+
+### Response schemas
+
+Enable a request's **Schema** tab in the UI, save it, and export the collection. The CLI reads the same optional request field; the schema itself is stored as JSON text:
+
+```json
+{
+  "name": "Get user",
+  "method": "GET",
+  "url": "{{baseUrl}}/users/1",
+  "responseSchema": {
+    "enabled": true,
+    "schema": "{\"type\":\"object\",\"required\":[\"id\"],\"properties\":{\"id\":{\"type\":\"integer\"}}}"
+  }
+}
+```
+
+JSON Schema draft-07, local references, and standard formats are supported. Schemas are literal text: environment substitution and remote reference loading are not performed. A mismatch or non-JSON response fails the request with field paths such as `/id`; a malformed schema or worker timeout produces an errored request. Both exit with code 1 and trigger `--bail`. A malformed `responseSchema` configuration object is an input error (code 2). Disabled schemas are retained and skipped.
+
+Schema and script assertions both appear in JSON/JUnit reports. Passing scripts cannot override schema failures. Each schema has a 100,000-character limit and runs in a disposable worker with a two-second processing budget and a ten-second startup limit. At most 25 constraint errors are listed, followed by a count of omitted errors.
+
+## Execution and exit codes
+
+| Option | Behavior |
+| --- | --- |
+| `--bail` / `--stop-on-failure` | Skip remaining requests after the first failure or error |
+| `--delay MS` | Delay between requests, from 0 to 60000 ms; default 0 |
+| `--timeout-request MS` | Bound the complete network request, including downloading the body; default 30000 ms |
+| `--timeout-script MS` | Bound each script's execution; default 1000 ms, maximum 60000 ms |
+| `--report-json FILE` | Export a JSON report; parent directories are created |
+| `--report-junit FILE` | Export a JUnit XML report |
+
+Without a test script, HTTP 4xx/5xx responses fail the request even if a schema matches. With a test script, assertions decide success, allowing tests that deliberately expect error responses. Enabled response schemas must also pass. A thrown pre-request/test script, invalid schema, network error, or timeout always produces an errored result. Runs continue by default; `--bail` stops after the first unsuccessful result.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | All requests passed |
+| 1 | One or more requests failed, errored, or were skipped |
+| 2 | Invalid arguments/input, or reports could not be written |
+| 130 | Interrupted with Ctrl+C / SIGINT |
+| 143 | Interrupted with SIGTERM |
+
+Interruption cancels the current network request or script, skips remaining requests, and writes any requested partial reports. Scripts use the shared Pipelith assertion engine in a separate worker and VM context, with time and heap limits. Node globals and the process environment are not exposed to scripts. These mechanisms are not a security boundary for hostile JavaScript; run collections from sources you trust.
+
+## Performance benchmarks
+
+Use `bench` to repeat a collection or select one request by name or ID:
+
+```sh
+pipelith bench collection.json --iterations 100 --warmup 5 --env environment.json --threshold "p95<500" --threshold "failureRate<=0" --report-json reports/benchmark.json --report-junit reports/benchmark.xml
+pipelith bench collection.json --request "Get user" --iterations 20
+```
+
+Requests run sequentially, in collection order, once per iteration. Environment overrides, attachments, schemas, scripts, `--bail`, delay, request/script timeouts, and interruption work as in `run`. Chain variables start empty each iteration and flow between requests within that iteration. Warm-up executes the same requests and checks but is excluded from latency statistics and the measured failure rate. Warm-up failures still fail the benchmark and trigger `--bail` when enabled.
+
+| Benchmark option | Behavior |
+| --- | --- |
+| `--iterations N` | Measured iterations, default 10, range 1–10000 |
+| `--warmup N` | Warm-up iterations, default 0, range 0–1000 |
+| `--request NAME_OR_ID` | Select exactly one request in the selected collection |
+| `--threshold EXPRESSION` | Repeatable upper limits, applied separately to every request |
+
+At most 10,000 requests may be scheduled, including warm-up. These options require `bench`. Thresholds accept `<` or `<=`, with `avg`, `min`, `max`, `median`, `p95`, or `p99` in milliseconds, and `failureRate` in percent. For example, `failureRate<=1` means at most 1%, not 100%. Up to 20 thresholds are supported. Every request must satisfy its own thresholds; a fast endpoint cannot mask a slow one. Missing measurements or incomplete measured iterations cannot pass a latency threshold.
+
+The CLI prints average, median, p95, p99, min/max, sample count, and failure rate for each request. Latency measures the target HTTP round trip through complete body download, excluding script workers, schema validation, and response formatting. Total execution duration includes that work and configured delays. Timed-out requests and pre-request/network failures have no HTTP latency sample; HTTP error responses and failed schema/script checks retain their actual HTTP time. Failure rate counts failed and errored measured executions. Threshold comparisons use unrounded values; displayed values are rounded to two decimals. Percentiles use linear interpolation at `(sampleCount - 1) * percentile`; small runs have limited percentile resolution.
+
+Exit code 0 requires all executions (including warm-up) and thresholds to pass. Any assertion, HTTP, network, schema, or threshold failure returns 1; a failure-rate budget never suppresses an existing request failure. Invalid settings return 2; interruption retains the existing signal exit codes and writes partial reports.
+
+Benchmark JSON uses a separate `kind: "benchmark"` report with settings, per-request and aggregate statistics, warm-up counts, iteration assertions, and threshold results. JUnit contains one case per execution (including warm-up), skipped cases for unexecuted requests, and one additional case per request/threshold. Cancelled runs include an interruption error case. Reports retain the same privacy rules as ordinary run reports below.
+
+The browser/desktop Benchmark dialog exports these same reports. Run the CI fixture with `node examples/ci/run.mjs --bench`; the CLI CI workflow runs it on Linux and Windows.
+
+## Reports
+
+JSON includes the collection name, start time, request totals, durations, HTTP statuses, individual assertions, errors, and skip reasons. JUnit has one test case per request, with failed assertions in the failure detail and network/script/schema configuration problems represented as errors. Case names include their position so identically named requests remain distinct in CI. Counts in the summary and JUnit suite are request counts.
+
+Reports omit request URLs, headers, credentials, response bodies, chain variables, and console logs. Request/test names and assertion error messages are included, so those fields should not embed secrets.
+
+In the UI, run a collection and use **Export report → JSON / JUnit XML**. Both interfaces use the same report format. A new run clears the previous report.
+
+## GitHub Actions
+
+The repository includes `examples/ci/collection.json`, `examples/ci/environment.json`, and a local fixture server. The **CLI CI** workflow builds and tests the CLI on Linux and Windows, then runs that sample collection and uploads both reports even when a run fails.
+
+For a pipeline checking an existing API, build the CLI and replace the fixture paths with your exported collection and environment:
+
+```yaml
+- uses: actions/checkout@v4
+- uses: actions/setup-node@v4
+  with:
+    node-version: '22'
+    cache: npm
+- run: npm ci
+- run: npm run build:cli
+- name: Run API tests
+  env:
+    API_TOKEN: ${{ secrets.API_TOKEN }}
+  run: >-
+    node bin/pipelith.cjs run tests/api/collection.json
+    --env tests/api/environment.json
+    --var-from-env token=API_TOKEN
+    --report-json reports/result.json
+    --report-junit reports/result.xml
+- uses: actions/upload-artifact@v4
+  if: always()
+  with:
+    name: api-test-reports
+    path: reports/
+```

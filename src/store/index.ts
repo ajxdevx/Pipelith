@@ -1,0 +1,742 @@
+import { create } from 'zustand';
+import type {
+  RequestConfig,
+  ResponseData,
+  Collection,
+  HistoryEntry,
+  Environment,
+  Tab,
+  HttpMethod,
+  TestResult,
+  ScriptConsoleEntry,
+  WebSocketSession,
+  WebSocketMessage,
+  WebSocketConnectionStatus,
+} from '../types';
+import { createDefaultRequest, createDefaultWebSocketSession } from '../types';
+import { removeFilesForRequest } from '../utils/fileStore';
+import type { BackupData, BackupSnapshot, ImportMode } from '../utils/backup';
+import { applyBackup } from '../utils/backup';
+
+const STORAGE_KEYS = {
+  collections: 'pipelith_collections',
+  history: 'pipelith_history',
+  environments: 'pipelith_environments',
+  activeEnv: 'pipelith_active_env',
+  theme: 'pipelith_theme',
+  chainVariables: 'pipelith_chain_vars',
+  syncToken: 'pipelith_sync_token',
+  syncGistId: 'pipelith_sync_gist_id',
+  syncLastSyncedAt: 'pipelith_sync_last_synced_at',
+};
+
+/** One-time copy from legacy localStorage keys after upgrades. */
+function migrateLegacyStorageKeys() {
+  if (typeof localStorage === 'undefined') return;
+  for (const next of Object.values(STORAGE_KEYS)) {
+    const legacy = next.replace(/^pipelith_/, 'curlit_');
+    if (localStorage.getItem(next) == null && localStorage.getItem(legacy) != null) {
+      localStorage.setItem(next, localStorage.getItem(legacy)!);
+    }
+  }
+  for (const legacy of ['curlit-sidebar-width', 'curlit-request-height']) {
+    const next = legacy.replace('curlit', 'pipelith');
+    if (localStorage.getItem(next) == null && localStorage.getItem(legacy) != null) {
+      localStorage.setItem(next, localStorage.getItem(legacy)!);
+    }
+  }
+}
+
+migrateLegacyStorageKeys();
+
+function loadFromStorage<T>(key: string, fallback: T): T {
+  try {
+    const data = localStorage.getItem(key);
+    return data ? JSON.parse(data) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function saveToStorage(key: string, data: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify(data));
+  } catch {
+    // storage full, silently fail
+  }
+}
+
+export type SidebarView = 'collections' | 'history' | 'environments';
+export type Theme = 'dark' | 'light';
+
+interface AppState {
+  // Tabs
+  tabs: Tab[];
+  activeTabId: string | null;
+
+  // Requests (keyed by ID)
+  requests: Record<string, RequestConfig>;
+  responses: Record<string, ResponseData | null>;
+  loadingRequests: Record<string, boolean>;
+
+  // Collections
+  collections: Collection[];
+
+  // History
+  history: HistoryEntry[];
+
+  // Environments
+  environments: Environment[];
+  activeEnvironmentId: string | null;
+
+  // Scripts & Tests
+  testResults: Record<string, TestResult[]>;
+  scriptLogs: Record<string, ScriptConsoleEntry[]>;
+  chainVariables: Record<string, string>;
+
+  // WebSocket
+  webSocketSessions: Record<string, WebSocketSession>;
+
+  // Sync (GitHub Gist)
+  syncToken: string | null;
+  syncGistId: string | null;
+  syncLastSyncedAt: number | null;
+
+  // UI
+  theme: Theme;
+  sidebarView: SidebarView;
+  sidebarOpen: boolean;
+
+  // Actions - Tabs
+  addTab: (request?: Partial<RequestConfig>) => string;
+  duplicateTab: () => void;
+  closeTab: (tabId: string) => void;
+  setActiveTab: (tabId: string) => void;
+
+  // Actions - Requests
+  updateRequest: (id: string, updates: Partial<RequestConfig>) => void;
+  setResponse: (id: string, response: ResponseData | null) => void;
+  setLoading: (id: string, loading: boolean) => void;
+
+  // Actions - Collections
+  createCollection: (name: string) => void;
+  deleteCollection: (id: string) => void;
+  renameCollection: (id: string, name: string) => void;
+  saveRequestToCollection: (collectionId: string, request: RequestConfig) => void;
+  removeRequestFromCollection: (collectionId: string, requestId: string) => void;
+  openRequestFromCollection: (collectionId: string, requestId: string) => void;
+
+  // Actions - History
+  addToHistory: (request: RequestConfig, response: ResponseData | null) => void;
+  clearHistory: () => void;
+  openFromHistory: (entry: HistoryEntry) => void;
+
+  // Actions - Environments
+  createEnvironment: (name: string) => void;
+  deleteEnvironment: (id: string) => void;
+  updateEnvironment: (id: string, updates: Partial<Environment>) => void;
+  setActiveEnvironment: (id: string | null) => void;
+  getActiveVariables: () => Record<string, string>;
+
+  // Actions - Scripts & Tests
+  setTestResults: (requestId: string, results: TestResult[]) => void;
+  setScriptLogs: (requestId: string, logs: ScriptConsoleEntry[]) => void;
+  updateChainVariables: (vars: Record<string, string>) => void;
+  clearChainVariables: () => void;
+  getChainVariables: () => Record<string, string>;
+
+  // Actions - WebSocket
+  setWebSocketStatus: (requestId: string, status: WebSocketConnectionStatus, error?: string | null) => void;
+  addWebSocketMessage: (requestId: string, message: WebSocketMessage) => void;
+  clearWebSocketMessages: (requestId: string) => void;
+  resetWebSocketSession: (requestId: string) => void;
+
+  // Actions - Save
+  saveActiveRequest: () => 'saved' | 'needs-collection';
+  markTabSaved: (tabId: string, collectionId: string, sourceRequestId: string) => void;
+
+  // Actions - Sync
+  setSyncToken: (token: string | null) => void;
+  clearSyncToken: () => void;
+  setSyncGistId: (id: string | null) => void;
+  setSyncLastSyncedAt: (timestamp: number | null) => void;
+  getSyncSnapshot: () => { collections: Collection[]; environments: Environment[]; activeEnvironmentId: string | null };
+  applySyncSnapshot: (
+    next: { collections: Collection[]; environments: Environment[]; activeEnvironmentId: string | null },
+  ) => void;
+
+  // Actions - Backup
+  getBackupSnapshot: () => BackupSnapshot;
+  importBackup: (backup: BackupData, mode: ImportMode) => void;
+
+  // Actions - UI
+  setTheme: (theme: Theme) => void;
+  toggleTheme: () => void;
+  setSidebarView: (view: SidebarView) => void;
+  toggleSidebar: () => void;
+}
+
+const initialRequest = createDefaultRequest({ name: 'Untitled Request' });
+
+export const useAppStore = create<AppState>((set, get) => ({
+  // Initial state
+  tabs: [
+    {
+      id: initialRequest.id,
+      requestId: initialRequest.id,
+      name: 'Untitled Request',
+      method: 'GET',
+      isModified: false,
+    },
+  ],
+  activeTabId: initialRequest.id,
+  requests: { [initialRequest.id]: initialRequest },
+  responses: {},
+  loadingRequests: {},
+  collections: loadFromStorage<Collection[]>(STORAGE_KEYS.collections, []),
+  history: loadFromStorage<HistoryEntry[]>(STORAGE_KEYS.history, []),
+  environments: loadFromStorage<Environment[]>(STORAGE_KEYS.environments, []),
+  activeEnvironmentId: loadFromStorage<string | null>(STORAGE_KEYS.activeEnv, null),
+  testResults: {},
+  scriptLogs: {},
+  chainVariables: loadFromStorage<Record<string, string>>(STORAGE_KEYS.chainVariables, {}),
+  webSocketSessions: {},
+  syncToken: loadFromStorage<string | null>(STORAGE_KEYS.syncToken, null),
+  syncGistId: loadFromStorage<string | null>(STORAGE_KEYS.syncGistId, null),
+  syncLastSyncedAt: loadFromStorage<number | null>(STORAGE_KEYS.syncLastSyncedAt, null),
+  theme: loadFromStorage<Theme>(STORAGE_KEYS.theme, 'dark'),
+  sidebarView: 'collections',
+  sidebarOpen: true,
+
+  // Tab actions
+  addTab: (requestOverrides) => {
+    const request = createDefaultRequest({
+      name: 'Untitled Request',
+      ...requestOverrides,
+    });
+    const tab: Tab = {
+      id: request.id,
+      requestId: request.id,
+      name: request.name,
+      method: request.method,
+      protocol: request.protocol,
+      isModified: false,
+    };
+    set(state => ({
+      tabs: [...state.tabs, tab],
+      activeTabId: tab.id,
+      requests: { ...state.requests, [request.id]: request },
+    }));
+    return request.id;
+  },
+
+  duplicateTab: () => {
+    const state = get();
+    const activeTab = state.tabs.find(t => t.id === state.activeTabId);
+    if (!activeTab) return;
+    const request = state.requests[activeTab.requestId];
+    if (!request) return;
+
+    const requestData = { ...request };
+    delete (requestData as Partial<RequestConfig>).id;
+    const newReq = createDefaultRequest({
+      ...requestData,
+      name: `${request.name} (copy)`,
+    });
+    const tab: Tab = {
+      id: newReq.id,
+      requestId: newReq.id,
+      name: newReq.name,
+      method: newReq.method,
+      protocol: newReq.protocol,
+      isModified: false,
+    };
+    set(s => ({
+      tabs: [...s.tabs, tab],
+      activeTabId: tab.id,
+      requests: { ...s.requests, [newReq.id]: newReq },
+    }));
+  },
+
+  closeTab: (tabId) => {
+    set(state => {
+      const newTabs = state.tabs.filter(t => t.id !== tabId);
+      const newRequests = { ...state.requests };
+      const newResponses = { ...state.responses };
+      const newWsSessions = { ...state.webSocketSessions };
+      const tab = state.tabs.find(t => t.id === tabId);
+      if (tab) {
+        // Lazy import to avoid circular dependency (websocket.ts imports this store)
+        import('../utils/websocket').then(m => m.disconnectWebSocket(tab.requestId));
+        removeFilesForRequest(tab.requestId);
+        delete newRequests[tab.requestId];
+        delete newResponses[tab.requestId];
+        delete newWsSessions[tab.requestId];
+      }
+
+      let newActiveTabId = state.activeTabId;
+      if (state.activeTabId === tabId) {
+        const idx = state.tabs.findIndex(t => t.id === tabId);
+        if (newTabs.length > 0) {
+          newActiveTabId = newTabs[Math.min(idx, newTabs.length - 1)].id;
+        } else {
+          // Always keep at least one tab
+          const newReq = createDefaultRequest({ name: 'Untitled Request' });
+          const newTab: Tab = {
+            id: newReq.id,
+            requestId: newReq.id,
+            name: 'Untitled Request',
+            method: 'GET',
+            isModified: false,
+          };
+          newTabs.push(newTab);
+          newRequests[newReq.id] = newReq;
+          newActiveTabId = newTab.id;
+        }
+      }
+
+      return {
+        tabs: newTabs,
+        activeTabId: newActiveTabId,
+        requests: newRequests,
+        responses: newResponses,
+        webSocketSessions: newWsSessions,
+      };
+    });
+  },
+
+  setActiveTab: (tabId) => set({ activeTabId: tabId }),
+
+  // Request actions
+  updateRequest: (id, updates) => {
+    set(state => {
+      const existing = state.requests[id];
+      if (!existing) return state;
+      const updated = { ...existing, ...updates };
+      const newTabs = state.tabs.map(t =>
+        t.requestId === id
+          ? { ...t, name: updated.name, method: updated.method as HttpMethod, protocol: updated.protocol, isModified: true }
+          : t
+      );
+      return {
+        requests: { ...state.requests, [id]: updated },
+        tabs: newTabs,
+      };
+    });
+  },
+
+  setResponse: (id, response) => {
+    set(state => ({
+      responses: { ...state.responses, [id]: response },
+    }));
+  },
+
+  setLoading: (id, loading) => {
+    set(state => ({
+      loadingRequests: { ...state.loadingRequests, [id]: loading },
+    }));
+  },
+
+  // Collection actions
+  createCollection: (name) => {
+    const collection: Collection = {
+      id: crypto.randomUUID(),
+      name,
+      requests: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    set(state => {
+      const collections = [...state.collections, collection];
+      saveToStorage(STORAGE_KEYS.collections, collections);
+      return { collections };
+    });
+  },
+
+  deleteCollection: (id) => {
+    set(state => {
+      const collections = state.collections.filter(c => c.id !== id);
+      saveToStorage(STORAGE_KEYS.collections, collections);
+      return { collections };
+    });
+  },
+
+  renameCollection: (id, name) => {
+    set(state => {
+      const collections = state.collections.map(c =>
+        c.id === id ? { ...c, name, updatedAt: Date.now() } : c
+      );
+      saveToStorage(STORAGE_KEYS.collections, collections);
+      return { collections };
+    });
+  },
+
+  saveRequestToCollection: (collectionId, request) => {
+    set(state => {
+      const collections = state.collections.map(c => {
+        if (c.id !== collectionId) return c;
+        const existingIdx = c.requests.findIndex(r => r.id === request.id);
+        const newRequests = [...c.requests];
+        if (existingIdx >= 0) {
+          newRequests[existingIdx] = request;
+        } else {
+          newRequests.push({ ...request, id: crypto.randomUUID() });
+        }
+        return { ...c, requests: newRequests, updatedAt: Date.now() };
+      });
+      saveToStorage(STORAGE_KEYS.collections, collections);
+      return { collections };
+    });
+  },
+
+  removeRequestFromCollection: (collectionId, requestId) => {
+    set(state => {
+      const collections = state.collections.map(c => {
+        if (c.id !== collectionId) return c;
+        return {
+          ...c,
+          requests: c.requests.filter(r => r.id !== requestId),
+          updatedAt: Date.now(),
+        };
+      });
+      saveToStorage(STORAGE_KEYS.collections, collections);
+      return { collections };
+    });
+  },
+
+  openRequestFromCollection: (collectionId, requestId) => {
+    const state = get();
+    const collection = state.collections.find(c => c.id === collectionId);
+    if (!collection) return;
+    const request = collection.requests.find(r => r.id === requestId);
+    if (!request) return;
+
+    // Check if already open
+    const existingTab = state.tabs.find(t => t.sourceRequestId === requestId && t.collectionId === collectionId);
+    if (existingTab) {
+      set({ activeTabId: existingTab.id });
+    } else {
+      const newReq = { ...request, id: crypto.randomUUID() };
+      const tab: Tab = {
+        id: newReq.id,
+        requestId: newReq.id,
+        name: newReq.name,
+        method: newReq.method,
+        protocol: newReq.protocol,
+        isModified: false,
+        collectionId,
+        sourceRequestId: requestId,
+      };
+      set(s => ({
+        tabs: [...s.tabs, tab],
+        activeTabId: tab.id,
+        requests: { ...s.requests, [newReq.id]: newReq },
+      }));
+    }
+  },
+
+  // History actions
+  addToHistory: (request, response) => {
+    const entry: HistoryEntry = {
+      id: crypto.randomUUID(),
+      request: { ...request },
+      response,
+      timestamp: Date.now(),
+    };
+    set(state => {
+      const history = [entry, ...state.history].slice(0, 100);
+      saveToStorage(STORAGE_KEYS.history, history);
+      return { history };
+    });
+  },
+
+  clearHistory: () => {
+    saveToStorage(STORAGE_KEYS.history, []);
+    set({ history: [] });
+  },
+
+  openFromHistory: (entry) => {
+    get().addTab({
+      ...entry.request,
+      id: undefined as unknown as string,
+      name: entry.request.name || entry.request.url || 'From History',
+    });
+  },
+
+  // Environment actions
+  createEnvironment: (name) => {
+    const env: Environment = {
+      id: crypto.randomUUID(),
+      name,
+      variables: [],
+      isActive: false,
+    };
+    set(state => {
+      const environments = [...state.environments, env];
+      saveToStorage(STORAGE_KEYS.environments, environments);
+      return { environments };
+    });
+  },
+
+  deleteEnvironment: (id) => {
+    set(state => {
+      const environments = state.environments.filter(e => e.id !== id);
+      saveToStorage(STORAGE_KEYS.environments, environments);
+      const activeEnvironmentId = state.activeEnvironmentId === id ? null : state.activeEnvironmentId;
+      saveToStorage(STORAGE_KEYS.activeEnv, activeEnvironmentId);
+      return { environments, activeEnvironmentId };
+    });
+  },
+
+  updateEnvironment: (id, updates) => {
+    set(state => {
+      const environments = state.environments.map(e =>
+        e.id === id ? { ...e, ...updates } : e
+      );
+      saveToStorage(STORAGE_KEYS.environments, environments);
+      return { environments };
+    });
+  },
+
+  setActiveEnvironment: (id) => {
+    saveToStorage(STORAGE_KEYS.activeEnv, id);
+    set({ activeEnvironmentId: id });
+  },
+
+  getActiveVariables: () => {
+    const state = get();
+    const activeEnv = state.environments.find(e => e.id === state.activeEnvironmentId);
+    if (!activeEnv) return {};
+    const vars: Record<string, string> = {};
+    activeEnv.variables.filter(v => v.enabled && v.key).forEach(v => {
+      vars[v.key] = v.value;
+    });
+    return vars;
+  },
+
+  // Script & Test actions
+  setTestResults: (requestId, results) => {
+    set(state => ({
+      testResults: { ...state.testResults, [requestId]: results },
+    }));
+  },
+
+  setScriptLogs: (requestId, logs) => {
+    set(state => ({
+      scriptLogs: { ...state.scriptLogs, [requestId]: logs },
+    }));
+  },
+
+  updateChainVariables: (vars) => {
+    set(state => {
+      const chainVariables = { ...state.chainVariables, ...vars };
+      saveToStorage(STORAGE_KEYS.chainVariables, chainVariables);
+      return { chainVariables };
+    });
+  },
+
+  clearChainVariables: () => {
+    saveToStorage(STORAGE_KEYS.chainVariables, {});
+    set({ chainVariables: {} });
+  },
+
+  getChainVariables: () => get().chainVariables,
+
+  // WebSocket actions
+  setWebSocketStatus: (requestId, status, error) => {
+    set(state => {
+      // Guard: don't create entries for requests that have been removed (e.g. late callbacks after tab close)
+      if (!state.requests[requestId]) return state;
+      const session = state.webSocketSessions[requestId] || createDefaultWebSocketSession();
+      const updated = { ...session, status, error: error ?? null };
+      if (status === 'connected') {
+        updated.connectedAt = Date.now();
+        updated.disconnectedAt = null;
+      } else if (status === 'disconnected') {
+        updated.disconnectedAt = Date.now();
+      }
+      return { webSocketSessions: { ...state.webSocketSessions, [requestId]: updated } };
+    });
+  },
+
+  addWebSocketMessage: (requestId, message) => {
+    set(state => {
+      if (!state.requests[requestId]) return state;
+      const session = state.webSocketSessions[requestId] || createDefaultWebSocketSession();
+      const messages = [...session.messages, message].slice(-1000);
+      return {
+        webSocketSessions: {
+          ...state.webSocketSessions,
+          [requestId]: { ...session, messages },
+        },
+      };
+    });
+  },
+
+  clearWebSocketMessages: (requestId) => {
+    set(state => {
+      const session = state.webSocketSessions[requestId];
+      if (!session) return state;
+      return {
+        webSocketSessions: {
+          ...state.webSocketSessions,
+          [requestId]: { ...session, messages: [] },
+        },
+      };
+    });
+  },
+
+  resetWebSocketSession: (requestId) => {
+    set(state => ({
+      webSocketSessions: {
+        ...state.webSocketSessions,
+        [requestId]: createDefaultWebSocketSession(),
+      },
+    }));
+  },
+
+  // Save actions
+  saveActiveRequest: () => {
+    const state = get();
+    const activeTab = state.tabs.find(t => t.id === state.activeTabId);
+    if (!activeTab) return 'needs-collection';
+
+    const request = state.requests[activeTab.requestId];
+    if (!request) return 'needs-collection';
+
+    if (activeTab.collectionId && activeTab.sourceRequestId) {
+      // Save back to source collection in-place
+      const collection = state.collections.find(c => c.id === activeTab.collectionId);
+      if (!collection || !collection.requests.some(r => r.id === activeTab.sourceRequestId)) {
+        return 'needs-collection';
+      }
+      const collections = state.collections.map(c => {
+        if (c.id !== activeTab.collectionId) return c;
+        return {
+          ...c,
+          requests: c.requests.map(r =>
+            r.id === activeTab.sourceRequestId ? { ...request, id: activeTab.sourceRequestId! } : r
+          ),
+          updatedAt: Date.now(),
+        };
+      });
+      saveToStorage(STORAGE_KEYS.collections, collections);
+      set({
+        collections,
+        tabs: state.tabs.map(t =>
+          t.id === activeTab.id ? { ...t, isModified: false } : t
+        ),
+      });
+      return 'saved';
+    }
+
+    return 'needs-collection';
+  },
+
+  markTabSaved: (tabId, collectionId, sourceRequestId) => {
+    set(state => ({
+      tabs: state.tabs.map(t =>
+        t.id === tabId ? { ...t, collectionId, sourceRequestId, isModified: false } : t
+      ),
+    }));
+  },
+
+  // Backup actions
+  getBackupSnapshot: () => {
+    const state = get();
+    return {
+      collections: state.collections,
+      environments: state.environments,
+      activeEnvironmentId: state.activeEnvironmentId,
+      history: state.history,
+      chainVariables: state.chainVariables,
+      theme: state.theme,
+    };
+  },
+
+  importBackup: (backup, mode) => {
+    const state = get();
+    const current: BackupSnapshot = {
+      collections: state.collections,
+      environments: state.environments,
+      activeEnvironmentId: state.activeEnvironmentId,
+      history: state.history,
+      chainVariables: state.chainVariables,
+      theme: state.theme,
+    };
+    const next = applyBackup(current, backup, mode);
+
+    saveToStorage(STORAGE_KEYS.collections, next.collections);
+    saveToStorage(STORAGE_KEYS.environments, next.environments);
+    saveToStorage(STORAGE_KEYS.activeEnv, next.activeEnvironmentId);
+    saveToStorage(STORAGE_KEYS.history, next.history);
+    saveToStorage(STORAGE_KEYS.chainVariables, next.chainVariables);
+    saveToStorage(STORAGE_KEYS.theme, next.theme);
+
+    if (typeof document !== 'undefined') {
+      document.documentElement.setAttribute('data-theme', next.theme);
+    }
+
+    set({
+      collections: next.collections,
+      environments: next.environments,
+      activeEnvironmentId: next.activeEnvironmentId,
+      history: next.history,
+      chainVariables: next.chainVariables,
+      theme: next.theme,
+    });
+  },
+
+  // Sync actions
+  setSyncToken: (token) => {
+    saveToStorage(STORAGE_KEYS.syncToken, token);
+    set({ syncToken: token });
+  },
+  clearSyncToken: () => {
+    saveToStorage(STORAGE_KEYS.syncToken, null);
+    saveToStorage(STORAGE_KEYS.syncGistId, null);
+    saveToStorage(STORAGE_KEYS.syncLastSyncedAt, null);
+    set({ syncToken: null, syncGistId: null, syncLastSyncedAt: null });
+  },
+  setSyncGistId: (id) => {
+    saveToStorage(STORAGE_KEYS.syncGistId, id);
+    set({ syncGistId: id });
+  },
+  setSyncLastSyncedAt: (timestamp) => {
+    saveToStorage(STORAGE_KEYS.syncLastSyncedAt, timestamp);
+    set({ syncLastSyncedAt: timestamp });
+  },
+  getSyncSnapshot: () => {
+    const state = get();
+    return {
+      collections: state.collections,
+      environments: state.environments,
+      activeEnvironmentId: state.activeEnvironmentId,
+    };
+  },
+  applySyncSnapshot: (next) => {
+    saveToStorage(STORAGE_KEYS.collections, next.collections);
+    saveToStorage(STORAGE_KEYS.environments, next.environments);
+    saveToStorage(STORAGE_KEYS.activeEnv, next.activeEnvironmentId);
+    set({
+      collections: next.collections,
+      environments: next.environments,
+      activeEnvironmentId: next.activeEnvironmentId,
+    });
+  },
+
+  // UI actions
+  setTheme: (theme) => {
+    document.documentElement.setAttribute('data-theme', theme);
+    saveToStorage(STORAGE_KEYS.theme, theme);
+    set({ theme });
+  },
+  toggleTheme: () => {
+    const newTheme = get().theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', newTheme);
+    saveToStorage(STORAGE_KEYS.theme, newTheme);
+    set({ theme: newTheme });
+  },
+  setSidebarView: (view) => set({ sidebarView: view }),
+  toggleSidebar: () => set(state => ({ sidebarOpen: !state.sidebarOpen })),
+}));

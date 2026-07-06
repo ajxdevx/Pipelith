@@ -1,0 +1,395 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  PanelLeftClose,
+  PanelLeftOpen,
+  Terminal,
+  FileCode,
+  Globe,
+  Keyboard,
+  GripVertical,
+  GripHorizontal,
+  Sun,
+  Moon,
+  Archive,
+  Share2,
+  Cloud,
+  Cpu,
+} from 'lucide-react';
+import { getProxyMode, onProxyModeChange, localProxyHealthUrl, type ProxyMode } from './utils/proxyConfig';
+import { AgentSettingsModal } from './components/AgentSettingsModal';
+import { useAppStore } from './store';
+import { RequestTabs } from './components/RequestTabs';
+import { UrlBar } from './components/UrlBar';
+import { RequestPanel } from './components/RequestPanel';
+import { ResponsePanel } from './components/ResponsePanel';
+import { Sidebar } from './components/Sidebar';
+import { CurlImportModal } from './components/CurlImportModal';
+import { CurlExportModal } from './components/CurlExportModal';
+import { OpenApiImportModal } from './components/OpenApiImportModal';
+import { SaveRequestModal } from './components/SaveRequestModal';
+import { BackupModal } from './components/BackupModal';
+import { ShareRequestModal } from './components/ShareRequestModal';
+import { SyncModal } from './components/SyncModal';
+import { CollectionRunnerModal } from './components/CollectionRunnerModal';
+import { BenchmarkModal } from './components/BenchmarkModal';
+import type { Collection } from './types';
+import { useResizable } from './hooks/useResizable';
+import { disconnectWebSocket } from './utils/websocket';
+import { readShareFromLocation, sharedRequestToTabSeed } from './utils/share';
+
+function App() {
+  const activeTabId = useAppStore(s => s.activeTabId);
+  const tabs = useAppStore(s => s.tabs);
+  const requests = useAppStore(s => s.requests);
+  const responses = useAppStore(s => s.responses);
+  const loadingRequests = useAppStore(s => s.loadingRequests);
+  const sidebarOpen = useAppStore(s => s.sidebarOpen);
+  const toggleSidebar = useAppStore(s => s.toggleSidebar);
+  const theme = useAppStore(s => s.theme);
+  const toggleTheme = useAppStore(s => s.toggleTheme);
+  const activeEnvironmentId = useAppStore(s => s.activeEnvironmentId);
+  const environments = useAppStore(s => s.environments);
+
+  const [showCurlImport, setShowCurlImport] = useState(false);
+  const [showCurlExport, setShowCurlExport] = useState(false);
+  const [showOpenApiImport, setShowOpenApiImport] = useState(false);
+  const [showSaveModal, setShowSaveModal] = useState(false);
+  const [showBackup, setShowBackup] = useState(false);
+  const [showShare, setShowShare] = useState(false);
+  const [showSync, setShowSync] = useState(false);
+  const [showAgent, setShowAgent] = useState(false);
+  const [proxyMode, setProxyModeState] = useState<ProxyMode>(() => getProxyMode());
+  const [agentConnected, setAgentConnected] = useState(false);
+  const [runnerCollectionId, setRunnerCollectionId] = useState<string | null>(null);
+  const [benchmarkTarget, setBenchmarkTarget] = useState<Pick<Collection, 'name' | 'requests'> | null>(null);
+
+  const activeTab = tabs.find(t => t.id === activeTabId);
+  const activeRequest = activeTab ? requests[activeTab.requestId] : null;
+  const activeResponse = activeTab ? responses[activeTab.requestId] : null;
+  const activeLoading = activeTab ? loadingRequests[activeTab.requestId] : false;
+  const activeEnv = environments.find(e => e.id === activeEnvironmentId);
+
+  const { size: sidebarWidth, handleMouseDown: handleSidebarResize } = useResizable({
+    direction: 'horizontal',
+    initialSize: 280,
+    minSize: 200,
+    maxSize: 500,
+    storageKey: 'pipelith-sidebar-width',
+  });
+
+  const { size: requestHeight, handleMouseDown: handleVerticalResize } = useResizable({
+    direction: 'vertical',
+    initialSize: 300,
+    minSize: 150,
+    maxSize: 600,
+    storageKey: 'pipelith-request-height',
+  });
+
+  // Keyboard shortcuts
+  const handleKeyDown = useCallback((e: KeyboardEvent) => {
+    if (e.ctrlKey || e.metaKey) {
+      switch (e.key) {
+        case 'i':
+          e.preventDefault();
+          setShowCurlImport(true);
+          break;
+        case 'e':
+          e.preventDefault();
+          setShowCurlExport(true);
+          break;
+        case 'b':
+          e.preventDefault();
+          toggleSidebar();
+          break;
+        case 'n':
+          e.preventDefault();
+          useAppStore.getState().addTab();
+          break;
+        case 'd':
+          e.preventDefault();
+          useAppStore.getState().duplicateTab();
+          break;
+        case 's':
+          e.preventDefault();
+          {
+            const result = useAppStore.getState().saveActiveRequest();
+            if (result === 'needs-collection') {
+              setShowSaveModal(true);
+            }
+          }
+          break;
+      }
+    }
+  }, [toggleSidebar]);
+
+  useEffect(() => {
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleKeyDown]);
+
+  useEffect(() => onProxyModeChange(setProxyModeState), []);
+
+  useEffect(() => {
+    if (proxyMode !== 'local') {
+      setAgentConnected(false);
+      return;
+    }
+    let cancelled = false;
+    const ping = async () => {
+      try {
+        const res = await fetch(localProxyHealthUrl(), { signal: AbortSignal.timeout(3000) });
+        if (!cancelled) setAgentConnected(res.ok);
+      } catch {
+        if (!cancelled) setAgentConnected(false);
+      }
+    };
+    ping();
+    const id = window.setInterval(ping, 10000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [proxyMode]);
+
+  // Close all WebSocket connections on page unload
+  useEffect(() => {
+    const cleanup = () => {
+      const state = useAppStore.getState();
+      for (const requestId of Object.keys(state.webSocketSessions)) {
+        if (state.webSocketSessions[requestId]?.status === 'connected') {
+          disconnectWebSocket(requestId);
+        }
+      }
+    };
+    window.addEventListener('beforeunload', cleanup);
+    return () => window.removeEventListener('beforeunload', cleanup);
+  }, []);
+
+  // Open incoming shared request links (#share=...) as a new tab. Runs on
+  // mount and on hashchange (for same-tab navigations where the hash changes
+  // without a reload).
+  const initialShareProcessedRef = useRef(false);
+  useEffect(() => {
+    const importFromHash = () => {
+      try {
+        const payload = readShareFromLocation();
+        if (payload) {
+          useAppStore.getState().addTab(sharedRequestToTabSeed(payload));
+        }
+      } catch (err) {
+        alert(err instanceof Error ? err.message : 'Could not open share link');
+      }
+    };
+
+    // Mount-time check, guarded against React StrictMode double-invoke in dev
+    if (!initialShareProcessedRef.current) {
+      initialShareProcessedRef.current = true;
+      importFromHash();
+    }
+
+    window.addEventListener('hashchange', importFromHash);
+    return () => window.removeEventListener('hashchange', importFromHash);
+  }, []);
+
+  return (
+    <div className="flex flex-col h-full bg-dark-900">
+      {/* Top bar */}
+      <header className="flex items-center justify-between px-3 py-1.5 bg-dark-800 border-b border-dark-600 select-none flex-shrink-0">
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
+            <img src="/favicon.svg" alt="" className="h-5 w-5 rounded-md" width={20} height={20} />
+            <span className="text-sm font-bold text-dark-100 tracking-wide">Pipelith</span>
+          </div>
+          <div className="h-4 w-px bg-dark-600" />
+          <button
+            onClick={toggleSidebar}
+            className="p-1.5 text-dark-400 hover:text-dark-200 rounded transition-colors cursor-pointer"
+            title={sidebarOpen ? 'Hide sidebar (Ctrl+B)' : 'Show sidebar (Ctrl+B)'}
+          >
+            {sidebarOpen ? <PanelLeftClose size={16} /> : <PanelLeftOpen size={16} />}
+          </button>
+          <button
+            onClick={toggleTheme}
+            className="p-1.5 text-dark-400 hover:text-dark-200 rounded transition-colors cursor-pointer"
+            title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+          >
+            {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {activeEnv && (
+            <div className="flex items-center gap-1.5 px-2 py-1 bg-accent-green/10 border border-accent-green/30 rounded-md">
+              <Globe size={12} className="text-accent-green" />
+              <span className="text-[11px] text-accent-green font-medium">{activeEnv.name}</span>
+            </div>
+          )}
+
+          <button
+            onClick={() => setShowAgent(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-dark-300 hover:text-dark-100 bg-dark-700 hover:bg-dark-600 rounded-md transition-colors cursor-pointer"
+            title={
+              proxyMode === 'local'
+                ? agentConnected
+                  ? 'Local agent: connected'
+                  : 'Local agent: not running'
+                : 'Local agent (for localhost / intranet requests)'
+            }
+          >
+            <Cpu size={13} />
+            Agent
+            {proxyMode === 'local' && (
+              <span
+                className={`inline-block w-1.5 h-1.5 rounded-full ${
+                  agentConnected ? 'bg-accent-green' : 'bg-accent-red'
+                }`}
+              />
+            )}
+          </button>
+          <button
+            onClick={() => setShowSync(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-dark-300 hover:text-dark-100 bg-dark-700 hover:bg-dark-600 rounded-md transition-colors cursor-pointer"
+            title="Cloud sync via GitHub Gist"
+          >
+            <Cloud size={13} />
+            Sync
+          </button>
+          <button
+            onClick={() => setShowBackup(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-dark-300 hover:text-dark-100 bg-dark-700 hover:bg-dark-600 rounded-md transition-colors cursor-pointer"
+            title="Backup & Restore all data"
+          >
+            <Archive size={13} />
+            Backup
+          </button>
+          <button
+            onClick={() => setShowOpenApiImport(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-dark-300 hover:text-dark-100 bg-dark-700 hover:bg-dark-600 rounded-md transition-colors cursor-pointer"
+            title="Import OpenAPI / Swagger"
+          >
+            <FileCode size={13} />
+            OpenAPI
+          </button>
+          <button
+            onClick={() => setShowCurlImport(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-dark-300 hover:text-dark-100 bg-dark-700 hover:bg-dark-600 rounded-md transition-colors cursor-pointer"
+            title="Import cURL (Ctrl+I)"
+          >
+            <Terminal size={13} />
+            Import cURL
+          </button>
+          <button
+            onClick={() => setShowCurlExport(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-dark-300 hover:text-dark-100 bg-dark-700 hover:bg-dark-600 rounded-md transition-colors cursor-pointer"
+            title="Export as cURL (Ctrl+E)"
+          >
+            <FileCode size={13} />
+            Export cURL
+          </button>
+          <button
+            onClick={() => setShowShare(true)}
+            disabled={!activeRequest}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-dark-300 hover:text-dark-100 bg-dark-700 hover:bg-dark-600 rounded-md transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Share request as a link"
+          >
+            <Share2 size={13} />
+            Share
+          </button>
+        </div>
+      </header>
+
+      {/* Main content */}
+      <div className="flex-1 flex overflow-hidden">
+        {/* Sidebar */}
+        {sidebarOpen && (
+          <>
+            <div style={{ width: sidebarWidth }} className="flex-shrink-0 h-full overflow-hidden">
+              <Sidebar onRunCollection={id => setRunnerCollectionId(id)} onBenchmarkCollection={id => {
+                const collection = useAppStore.getState().collections.find(item => item.id === id);
+                if (collection) setBenchmarkTarget(structuredClone({ name: collection.name, requests: collection.requests }));
+              }} />
+            </div>
+            <div
+              onMouseDown={handleSidebarResize}
+              className="w-1.5 flex-shrink-0 bg-dark-700 hover:bg-accent-blue/50 cursor-col-resize transition-colors flex items-center justify-center group"
+            >
+              <GripVertical size={10} className="text-dark-500 opacity-0 group-hover:opacity-100" />
+            </div>
+          </>
+        )}
+
+        {/* Main area */}
+        <div className="flex-1 flex flex-col min-w-0 h-full">
+          {/* Request tabs */}
+          <RequestTabs />
+
+          {activeRequest ? (
+            <>
+              {/* URL bar */}
+              <UrlBar request={activeRequest} onBenchmark={() => setBenchmarkTarget(structuredClone({ name: activeRequest.name || 'Request', requests: [activeRequest] }))} />
+
+              {/* Request panel */}
+              <div style={{ height: requestHeight }} className="flex-shrink-0 overflow-hidden border-b border-dark-600">
+                <RequestPanel request={activeRequest} />
+              </div>
+
+              {/* Resize handle */}
+              <div
+                onMouseDown={handleVerticalResize}
+                className="h-1.5 flex-shrink-0 bg-dark-700 hover:bg-accent-blue/50 cursor-row-resize transition-colors flex items-center justify-center group"
+              >
+                <GripHorizontal size={10} className="text-dark-500 opacity-0 group-hover:opacity-100" />
+              </div>
+
+              {/* Response panel */}
+              <div className="flex-1 overflow-hidden">
+                <ResponsePanel
+                  key={activeRequest.id}
+                  response={activeResponse ?? null}
+                  loading={!!activeLoading}
+                  requestId={activeRequest.id}
+                  protocol={activeRequest.protocol}
+                />
+              </div>
+            </>
+          ) : (
+            <div className="flex-1 flex items-center justify-center text-dark-400">
+              <p>No request selected</p>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Status bar */}
+      <footer className="flex items-center justify-between px-3 py-1 bg-dark-800 border-t border-dark-600 text-[10px] text-dark-400 flex-shrink-0">
+        <div className="flex items-center gap-3">
+          <span>Pipelith v{__APP_VERSION__}</span>
+          <span>|</span>
+          <span>{tabs.length} tab{tabs.length !== 1 ? 's' : ''} open</span>
+        </div>
+        <div className="flex items-center gap-1">
+          <Keyboard size={10} />
+          <span>Ctrl+S Save | Ctrl+N New | Ctrl+D Duplicate | Ctrl+I Import | Ctrl+E Export | Ctrl+B Sidebar</span>
+        </div>
+      </footer>
+
+      {/* Modals */}
+      <CurlImportModal open={showCurlImport} onClose={() => setShowCurlImport(false)} />
+      <CurlExportModal open={showCurlExport} onClose={() => setShowCurlExport(false)} request={activeRequest} />
+      <OpenApiImportModal open={showOpenApiImport} onClose={() => setShowOpenApiImport(false)} />
+      <SaveRequestModal open={showSaveModal} onClose={() => setShowSaveModal(false)} />
+      <BackupModal open={showBackup} onClose={() => setShowBackup(false)} />
+      <ShareRequestModal open={showShare} onClose={() => setShowShare(false)} request={activeRequest} />
+      <SyncModal open={showSync} onClose={() => setShowSync(false)} />
+      <AgentSettingsModal open={showAgent} onClose={() => setShowAgent(false)} />
+      <CollectionRunnerModal
+        open={runnerCollectionId !== null}
+        onClose={() => setRunnerCollectionId(null)}
+        collection={useAppStore.getState().collections.find(c => c.id === runnerCollectionId) ?? null}
+      />
+      {benchmarkTarget && <BenchmarkModal target={benchmarkTarget} onClose={() => setBenchmarkTarget(null)} />}
+    </div>
+  );
+}
+
+export default App;
